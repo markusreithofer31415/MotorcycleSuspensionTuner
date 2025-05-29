@@ -1,0 +1,42 @@
+# Generated files
+*.apk
+*.ap_
+*.aab
+*.aar
+*.dex
+*.class
+
+# Build directory
+build/
+
+# .gradle directory
+.gradle/
+
+# Local configuration files (sdk path, etc.)
+local.properties
+
+# IDE files
+.idea/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+
+# Captures directory
+captures/
+
+# Keystore files
+*.jks
+*.keystore
+
+# Log files
+*.log
+
+# Heap dump files
+*.hprof
+
+# Crashlytics files
+com_crashlytics_export_strings.xml
+crashlytics.properties
+crashlytics-build.properties
+fabric.properties
