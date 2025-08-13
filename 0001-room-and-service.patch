@@ -1,0 +1,443 @@
+diff --git a/MotorcycleSuspensionTuner/app/build.gradle.kts b/MotorcycleSuspensionTuner/app/build.gradle.kts
+index 0000000..1111111 100644
+--- a/MotorcycleSuspensionTuner/app/build.gradle.kts
++++ b/MotorcycleSuspensionTuner/app/build.gradle.kts
+@@ -1,6 +1,7 @@
+ plugins {
+   id("com.android.application")
+   id("org.jetbrains.kotlin.android")
++  id("org.jetbrains.kotlin.kapt")
+ }
+ 
+ android {
+@@ -34,6 +35,8 @@ android {
+   buildFeatures {
+     viewBinding = true
+   }
++
++  packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+ }
+ 
+ dependencies {
+@@ -44,6 +47,16 @@ dependencies {
+   implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+   implementation("com.github.PhilJay:MPAndroidChart:v3.1.0")
+ 
++  // Room (persistente interne DB)
++  implementation("androidx.room:room-ktx:2.6.1")
++  kapt("androidx.room:room-compiler:2.6.1")
++
++  // Coroutines & Lifecycle (für Background-Work/Flows)
++  implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
++  implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
++
++  // Optional: Logging
++  implementation("androidx.core:core-ktx:1.9.0")
+   testImplementation("junit:junit:4.13.2")
+   androidTestImplementation("androidx.test.ext:junit:1.1.5")
+   androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
+diff --git a/MotorcycleSuspensionTuner/app/src/main/AndroidManifest.xml b/MotorcycleSuspensionTuner/app/src/main/AndroidManifest.xml
+index 0000000..2222222 100644
+--- a/MotorcycleSuspensionTuner/app/src/main/AndroidManifest.xml
++++ b/MotorcycleSuspensionTuner/app/src/main/AndroidManifest.xml
+@@ -3,7 +3,15 @@
+ <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+   package="com.example.motorcyclesuspensiontuner">
+ 
+-  <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
++  <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
++  <!-- Foreground-Service für Messung (Android 14+ verlangt Typen) -->
++  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
++  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+ 
+   <application
+     android:allowBackup="true"
+@@ -18,6 +26,16 @@
+     <activity
+       android:name=".MainActivity"
+       android:exported="true">
+       <intent-filter>
+         <action android:name="android.intent.action.MAIN" />
+         <category android:name="android.intent.category.LAUNCHER" />
+       </intent-filter>
+     </activity>
++
++    <!-- Sensor-Erfassung im Vordergrunddienst -->
++    <service
++      android:name=".sensing.SensorForegroundService"
++      android:exported="false"
++      android:foregroundServiceType="dataSync" />
++
+   </application>
+ </manifest>
+diff --git a/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/RunEntity.kt b/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/RunEntity.kt
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/RunEntity.kt
+@@ -0,0 +1,53 @@
++package com.example.motorcyclesuspensiontuner.data
++
++import androidx.room.Entity
++import androidx.room.PrimaryKey
++
++@Entity(tableName = "runs")
++data class RunEntity(
++  @PrimaryKey(autoGenerate = true) val id: Long = 0,
++  val startedAtMs: Long,
++  val bikeName: String? = null,
++  val mountPosition: String? = null, // "front" | "rear"
++  val clicksRebound: Int? = null,
++  val clicksCompression: Int? = null,
++  val preload: Float? = null, // mm
++  val notes: String? = null
++)
+diff --git a/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/WindowEntity.kt b/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/WindowEntity.kt
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/WindowEntity.kt
+@@ -0,0 +1,34 @@
++package com.example.motorcyclesuspensiontuner.data
++
++import androidx.room.Entity
++import androidx.room.ForeignKey
++import androidx.room.Index
++import androidx.room.PrimaryKey
++
++@Entity(
++  tableName = "windows",
++  foreignKeys = [
++    ForeignKey(
++      entity = RunEntity::class,
++      parentColumns = ["id"],
++      childColumns = ["runId"],
++      onDelete = ForeignKey.CASCADE
++    )
++  ],
++  indices = [Index("runId")]
++)
++data class WindowEntity(
++  @PrimaryKey(autoGenerate = true) val id: Long = 0,
++  val runId: Long,
++  val tStartMs: Long,
++  val tEndMs: Long,
++  val rmsZ: Double
++)
+diff --git a/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/RunDao.kt b/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/RunDao.kt
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/RunDao.kt
+@@ -0,0 +1,27 @@
++package com.example.motorcyclesuspensiontuner.data
++
++import androidx.room.Dao
++import androidx.room.Insert
++import androidx.room.OnConflictStrategy
++import androidx.room.Query
++import kotlinx.coroutines.flow.Flow
++
++@Dao
++interface RunDao {
++  @Insert(onConflict = OnConflictStrategy.REPLACE)
++  suspend fun insert(run: RunEntity): Long
++
++  @Query("SELECT * FROM runs ORDER BY startedAtMs DESC LIMIT 1")
++  suspend fun latest(): RunEntity?
++
++  @Query("SELECT * FROM runs ORDER BY startedAtMs DESC")
++  fun allRunsFlow(): Flow<List<RunEntity>>
++}
+diff --git a/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/WindowDao.kt b/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/WindowDao.kt
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/WindowDao.kt
+@@ -0,0 +1,26 @@
++package com.example.motorcyclesuspensiontuner.data
++
++import androidx.room.Dao
++import androidx.room.Insert
++import androidx.room.OnConflictStrategy
++import androidx.room.Query
++import kotlinx.coroutines.flow.Flow
++
++@Dao
++interface WindowDao {
++  @Insert(onConflict = OnConflictStrategy.REPLACE)
++  suspend fun insert(win: WindowEntity): Long
++
++  @Query("SELECT * FROM windows WHERE runId = :runId ORDER BY tStartMs ASC")
++  fun windowsForRun(runId: Long): Flow<List<WindowEntity>>
++
++  @Query("DELETE FROM windows WHERE runId = :runId")
++  suspend fun deleteForRun(runId: Long)
++}
+diff --git a/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/AppDatabase.kt b/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/AppDatabase.kt
+new file mode 100644
+index 0000000..7777777
+--- /dev/null
++++ b/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/AppDatabase.kt
+@@ -0,0 +1,38 @@
++package com.example.motorcyclesuspensiontuner.data
++
++import android.content.Context
++import androidx.room.Database
++import androidx.room.Room
++import androidx.room.RoomDatabase
++
++@Database(
++  entities = [RunEntity::class, WindowEntity::class],
++  version = 1,
++  exportSchema = false
++)
++abstract class AppDatabase : RoomDatabase() {
++  abstract fun runDao(): RunDao
++  abstract fun windowDao(): WindowDao
++
++  companion object {
++    @Volatile private var INSTANCE: AppDatabase? = null
++
++    fun get(context: Context): AppDatabase =
++      INSTANCE ?: synchronized(this) {
++        INSTANCE ?: Room.databaseBuilder(
++          context.applicationContext,
++          AppDatabase::class.java,
++          "suspension.db"
++        ).build().also { INSTANCE = it }
++      }
++  }
++}
+diff --git a/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/DataRepository.kt b/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/DataRepository.kt
+new file mode 100644
+index 0000000..8888888
+--- /dev/null
++++ b/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/data/DataRepository.kt
+@@ -0,0 +1,28 @@
++package com.example.motorcyclesuspensiontuner.data
++
++import android.content.Context
++
++class DataRepository(context: Context) {
++  private val db = AppDatabase.get(context)
++  private val runDao = db.runDao()
++  private val windowDao = db.windowDao()
++
++  suspend fun startRun(
++    bikeName: String? = null,
++    mountPosition: String? = null,
++    clicksRebound: Int? = null,
++    clicksCompression: Int? = null,
++    preload: Float? = null,
++    notes: String? = null
++  ): Long {
++    val run = RunEntity(
++      startedAtMs = System.currentTimeMillis(),
++      bikeName = bikeName, mountPosition = mountPosition,
++      clicksRebound = clicksRebound, clicksCompression = clicksCompression,
++      preload = preload, notes = notes
++    )
++    return runDao.insert(run)
++  }
++
++  suspend fun insertWindow(win: WindowEntity) = windowDao.insert(win)
++}
+diff --git a/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/sensing/SensorForegroundService.kt b/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/sensing/SensorForegroundService.kt
+new file mode 100644
+index 0000000..9999999
+--- /dev/null
++++ b/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/sensing/SensorForegroundService.kt
+@@ -0,0 +1,232 @@
++package com.example.motorcyclesuspensiontuner.sensing
++
++import android.app.Notification
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.Service
++import android.content.Context
++import android.content.Intent
++import android.hardware.Sensor
++import android.hardware.SensorEvent
++import android.hardware.SensorEventListener
++import android.hardware.SensorManager
++import android.os.Build
++import android.os.IBinder
++import androidx.core.app.NotificationCompat
++import androidx.core.content.getSystemService
++import com.example.motorcyclesuspensiontuner.data.DataRepository
++import com.example.motorcyclesuspensiontuner.data.WindowEntity
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import java.util.concurrent.ConcurrentLinkedQueue
++import kotlin.math.sqrt
++
++/**
++ * Foreground-Service, der Beschleunigungsdaten erfasst und als
++ * Fenster-Metriken (RMS Z) in Room schreibt.
++ *
++ * V1: Gerätekordinaten (Z), Rotation/Gravitation folgen im nächsten Schritt.
++ */
++class SensorForegroundService : Service(), SensorEventListener {
++
++  companion object {
++    const val ACTION_START = "com.example.motorcyclesuspensiontuner.action.START_RUN"
++    const val ACTION_STOP  = "com.example.motorcyclesuspensiontuner.action.STOP_RUN"
++    private const val CHANNEL_ID = "measurements"
++    private const val NOTIF_ID = 1001
++  }
++
++  private val scope = CoroutineScope(Dispatchers.Default)
++  private var repo: DataRepository? = null
++  private var sensorManager: SensorManager? = null
++  private var accelerometer: Sensor? = null
++
++  // Ringpuffer: (timestampMs, z)
++  private val buffer = ConcurrentLinkedQueue<Pair<Long, Float>>()
++
++  // Aggregator-Job (schreibt Fenster in DB)
++  private var windowJob: Job? = null
++  private var currentRunId: Long? = null
++
++  override fun onBind(intent: Intent?): IBinder? = null
++
++  override fun onCreate() {
++    super.onCreate()
++    repo = DataRepository(this)
++    sensorManager = getSystemService()
++    accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
++    createNotificationChannel()
++  }
++
++  override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++    when (intent?.action) {
++      ACTION_START -> startRun()
++      ACTION_STOP  -> stopRun()
++      else -> { /* ignore */ }
++    }
++    return START_STICKY
++  }
++
++  private fun startRun() {
++    if (currentRunId != null) return // läuft schon
++
++    // Foreground-Notification
++    val notif = NotificationCompat.Builder(this, CHANNEL_ID)
++      .setContentTitle("Suspension Tuner")
++      .setContentText("Messung läuft …")
++      .setSmallIcon(android.R.drawable.ic_media_play)
++      .setOngoing(true)
++      .build()
++    startForeground(NOTIF_ID, notif)
++
++    scope.launch {
++      currentRunId = repo?.startRun(mountPosition = null)
++    }
++    // Sensor-Listener registrieren (≈200 Hz; mit Batching)
++    accelerometer?.also { acc ->
++      val sm = sensorManager ?: return
++      val samplingUs = 5000 // ~200 Hz
++      val maxLatencyUs = 100_000 // 100 ms Batch
++      sm.registerListener(this, acc, samplingUs, maxLatencyUs)
++    }
++    // Aggregation: alle 100 ms ein 250-ms-Fenster schreiben
++    windowJob = scope.launch {
++      while (true) {
++        val now = System.currentTimeMillis()
++        val from = now - 250
++        val win = buffer.filter { it.first in from..now }
++        val rmsZ = computeRmsZ(win)
++        val runId = currentRunId
++        if (runId != null && !rmsZ.isNaN()) {
++          repo?.insertWindow(WindowEntity(
++            runId = runId,
++            tStartMs = from,
++            tEndMs = now,
++            rmsZ = rmsZ
++          ))
++        }
++        cleanupOld(now - 1000) // Puffer kurz halten
++        delay(100) // 10 Hz
++      }
++    }
++  }
++
++  private fun stopRun() {
++    windowJob?.cancel()
++    windowJob = null
++    sensorManager?.unregisterListener(this)
++    buffer.clear()
++    currentRunId = null
++    stopForeground(STOP_FOREGROUND_DETACH)
++    stopSelf()
++  }
++
++  override fun onDestroy() {
++    stopRun()
++    super.onDestroy()
++  }
++
++  override fun onSensorChanged(event: SensorEvent?) {
++    if (event?.sensor?.type != Sensor.TYPE_ACCELEROMETER) return
++    val ts = System.currentTimeMillis()
++    val z = event.values[2] // V1: Gerätez-Achse
++    buffer.add(ts to z)
++  }
++
++  override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
++
++  private fun computeRmsZ(samples: List<Pair<Long, Float>>): Double {
++    if (samples.isEmpty()) return Double.NaN
++    var sumSq = 0.0
++    for ((_, z) in samples) {
++      sumSq += (z * z).toDouble()
++    }
++    return sqrt(sumSq / samples.size)
++  }
++
++  private fun cleanupOld(cutoffMs: Long) {
++    while (true) {
++      val head = buffer.peek() ?: break
++      if (head.first < cutoffMs) buffer.poll() else break
++    }
++  }
++
++  private fun createNotificationChannel() {
++    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++      val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
++      val ch = NotificationChannel(CHANNEL_ID, "Measurements",
++        NotificationManager.IMPORTANCE_LOW)
++      ch.description = "Laufende Fahrwerksmessungen"
++      nm.createNotificationChannel(ch)
++    }
++  }
++}
+diff --git a/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/sensing/ServiceStarter.kt b/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/sensing/ServiceStarter.kt
+new file mode 100644
+index 0000000..aaaaaaa
+--- /dev/null
++++ b/MotorcycleSuspensionTuner/app/src/main/java/com/example/motorcyclesuspensiontuner/sensing/ServiceStarter.kt
+@@ -0,0 +1,32 @@
++package com.example.motorcyclesuspensiontuner.sensing
++
++import android.content.Context
++import android.content.Intent
++import androidx.core.content.ContextCompat
++
++object ServiceStarter {
++  fun start(context: Context) {
++    val i = Intent(context, SensorForegroundService::class.java).apply {
++      action = SensorForegroundService.ACTION_START
++    }
++    ContextCompat.startForegroundService(context, i)
++  }
++  fun stop(context: Context) {
++    val i = Intent(context, SensorForegroundService::class.java).apply {
++      action = SensorForegroundService.ACTION_STOP
++    }
++    context.startService(i)
++  }
++}
